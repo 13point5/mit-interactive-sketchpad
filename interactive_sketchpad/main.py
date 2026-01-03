@@ -304,4 +304,4 @@ async def upload_image(
 
 
 # Mount Chainlit at /chat path
-mount_chainlit(app=app, target="chatbot.py", path="/chat")
+mount_chainlit(app=app, target="interactive_sketchpad/chatbot.py", path="/chat")
