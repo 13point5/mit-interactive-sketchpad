@@ -1,14 +1,9 @@
 import json
 import os
-import subprocess
-from io import BytesIO
 from pathlib import Path
-import time
 from typing import List
 
 import chainlit as cl
-import httpx
-from chainlit.config import config
 from chainlit.element import Element
 from dotenv import load_dotenv
 from literalai.helper import utc_now
@@ -96,28 +91,36 @@ assistant = sync_openai_client.beta.assistants.create(
     temperature=0,
 )
 
-config.ui.name = assistant.name
 
-canvas_process = None
+async def send_image_to_sketchpad(image_bytes: bytes):
+    """Send an image to the web-based sketchpad via WebSocket."""
+    import base64
+    from interactive_sketchpad.state import get_sketchpad_connection, get_all_sketchpad_connections
 
+    print(f"[CHATBOT] send_image_to_sketchpad called, image size={len(image_bytes)} bytes")
 
-CANVAS_APP_URL = "http://0.0.0.0:8081/send_image_to_canvas"
+    connections = get_all_sketchpad_connections()
+    print(f"[CHATBOT] Available connections: {list(connections.keys())}")
 
+    websocket = get_sketchpad_connection("default")
+    if websocket:
+        try:
+            base64_image = base64.b64encode(image_bytes).decode("utf-8")
+            print(f"[CHATBOT] Sending base64 image, length={len(base64_image)}")
+            await websocket.send_json(
+                {"type": "image", "image": f"data:image/png;base64,{base64_image}"}
+            )
+            print("[CHATBOT] SUCCESS - Image sent to sketchpad!")
+        except Exception as e:
+            print(f"[CHATBOT] ERROR sending image: {e}")
+            import traceback
 
-async def send_image_to_canvas(image_bytes: bytes):
-    """Sends the generated image (in bytes) to the drawing app for display asynchronously using httpx."""
-    async with httpx.AsyncClient() as client:
-        files = {"file": ("generated.png", BytesIO(image_bytes), "image/png")}
-        response = await client.post(CANVAS_APP_URL, files=files)
-
-        if response.status_code == 200:
-            print("Image successfully sent to interactive canvas")
-        else:
-            print("Failed to send image:", response.text)
+            traceback.print_exc()
+    else:
+        print("[CHATBOT] FAILED - No WebSocket connection available")
 
 
 class EventHandler(AsyncAssistantEventHandler):
-
     def __init__(self, assistant_name: str) -> None:
         super().__init__()
         self.current_message: cl.Message = None
@@ -126,9 +129,7 @@ class EventHandler(AsyncAssistantEventHandler):
         self.assistant_name = assistant_name
 
     async def on_text_created(self, text) -> None:
-        self.current_message = await cl.Message(
-            author=self.assistant_name, content=""
-        ).send()
+        self.current_message = await cl.Message(author=self.assistant_name, content="").send()
 
     async def on_text_delta(self, delta, snapshot):
         await self.current_message.stream_token(delta.value)
@@ -171,8 +172,10 @@ class EventHandler(AsyncAssistantEventHandler):
         await self.current_step.update()
 
     async def on_image_file_done(self, image_file, show_image: bool = False):
+        print(f"[CHATBOT] on_image_file_done called, file_id={image_file.file_id}")
         image_id = image_file.file_id
         response = await async_openai_client.files.with_raw_response.content(image_id)
+        print(f"[CHATBOT] Downloaded image, size={len(response.content)} bytes")
 
         if show_image:
             # Show image in chatbot interface
@@ -183,9 +186,11 @@ class EventHandler(AsyncAssistantEventHandler):
                 self.current_message.elements = []
             self.current_message.elements.append(image_element)
             await self.current_message.update()
-        
-        # Send image to whiteboard
-        await send_image_to_canvas(response.content)
+
+        # Send image to web-based sketchpad
+        print("[CHATBOT] About to send image to sketchpad...")
+        await send_image_to_sketchpad(response.content)
+        print("[CHATBOT] Image sent to sketchpad completed")
 
 
 async def upload_files(files: List[Element], purpose: str = "assistants"):
@@ -224,40 +229,24 @@ async def append_images_to_message(message: cl.Message) -> None:
         message.content.append({"type": "text", "text": text_content})
 
     for file_id in file_ids:
-        message.content.append(
-            {"type": "image_file", "image_file": {"file_id": file_id}}
-        )
+        message.content.append({"type": "image_file", "image_file": {"file_id": file_id}})
 
 
 @cl.on_chat_start
 async def start_chat():
     thread = await async_openai_client.beta.threads.create()
     cl.user_session.set("thread_id", thread.id)
-    print("Session id:", cl.user_session.get("id"))
+    session_id = cl.user_session.get("id")
+    print("Session id:", session_id)
+
+    # Register this session as the latest (for single-user mode)
+    from interactive_sketchpad.state import set_latest_chainlit_session
+
+    set_latest_chainlit_session(session_id)
+
     await cl.Message(
-        content=f"Hello, I'm {assistant.name}! Your AI tutor that can draw! What can I help you with?"
+        content=f"Hello, I'm {assistant.name}! Your AI tutor that can draw! What can I help you with?",
     ).send()
-
-    # Start the drawing app with session ID as a command-line argument
-    global canvas_process
-    canvas_process = subprocess.Popen(
-        ["python", "interactive_canvas.py", cl.user_session.get("id")]
-    )
-
-    # Uncomment to run geometry3k
-    # await prompt_geometry_3k_question(question_path="geometry/2079/ex.json")
-
-
-@cl.on_chat_end
-async def end_chat():
-    """Terminate the drawing app when chat ends."""
-    global canvas_process
-
-    if canvas_process and canvas_process.poll() is None:  # Check if running
-        canvas_process.terminate()
-        canvas_process.wait()
-        canvas_process = None
-        print("Interactive canvas closed.")
 
 
 @cl.on_message
@@ -291,6 +280,6 @@ async def prompt_geometry_3k_question(question_path: str):
     with open(question_path, "r") as file:
         question = json.load(file)
         prompt = GeoPrompt().initial_prompt(question, n_images=1)
-        await cl.Message(content=f"Question:\n{question["annotat_text"]}").send()
+        await cl.Message(content=f"Question:\n{question['annotat_text']}").send()
         message = cl.Message(content=prompt)
         await main(message)
