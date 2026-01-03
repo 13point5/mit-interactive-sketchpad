@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: interactive-sketchpad
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: cd interactive_sketchpad && uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false  # You'll set this in the Render dashboard
+      - key: PYTHON_VERSION
+        value: "3.12.0"
+
